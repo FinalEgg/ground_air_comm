@@ -44,8 +44,9 @@ class UAVAttentionNet(nn.Module):
         obs 形如 (BatchSize, K * (3 + M)) 的一维展平 tensor 或 numpy 数组。
         由 Tianshou 的 Env 传来。
         """
-        if not isinstance(obs, torch.Tensor):
-            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        # 使用 as_tensor 避免重复内存拷贝，这是比手动 isinstance 判断更优的 torch 惯用写法
+        # 如果 obs 已经在正确的 device 上，它几乎是零开销的
+        obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
             
         # 如果是单一样本，增加 Batch 维度
         if len(obs.shape) == 1:
