@@ -1,5 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,8 @@ class UavMimoEnv(gym.Env):
     def __init__(self, num_bs=4, num_uav=10, num_antennas=16, 
                  qos_method='static', qos_threshold=1.5, 
                  max_power_dbm=30, area_size=1000.0, max_height=100.0, min_height=20.0,
-                 device='cpu'):
+                 device='cpu', include_qos_penalty=False, reward_scale=1e6,
+                 obs_beta_log10_center=-6.0, obs_beta_log10_scale=2.0):
         super().__init__()
         
         # 物理网格约束
@@ -34,9 +36,14 @@ class UavMimoEnv(gym.Env):
         # 强化学习相关的需求配置
         self.qos_method = qos_method         # 服务质量(QoS)保障的方法：'static'(静态惩罚) 或 'lagrangian'(拉格朗日乘数池化)
         self.qos_threshold = qos_threshold   # 目标QoS阈值 (代表要求的最低通信容量，单位bps/Hz)
+        self.include_qos_penalty = include_qos_penalty
+        self.reward_scale = reward_scale
+        self.obs_beta_log10_center = obs_beta_log10_center
+        self.obs_beta_log10_scale = max(obs_beta_log10_scale, 1e-6)
         
         # 内部张量计算引擎设置
         self.device = device # 外部指定设备
+        self.torch_device = torch.device(device)
         self.params = UAVMIMOTensorParams(device=self.device)
         self.params.p_d = 10 ** (max_power_dbm / 10) # 将最大发射功率池从dBm转换为线性功率
         self.ch_model = BatchedMIMOChannel(self.M, self.K, self.N, params=self.params)
@@ -45,41 +52,84 @@ class UavMimoEnv(gym.Env):
         # 矩阵形状: (M, 3) -> (X, Y, Z)
         # 初始化阶段先用 Numpy 生成坐标，随后立即转为 GPU Tensor 驻留显存
         bs_pos_np = np.zeros((self.M, 3), dtype=np.float32)
-        grid_width = int(np.sqrt(self.M))
+        grid_rows = max(1, math.ceil(math.sqrt(self.M)))
+        grid_cols = max(1, math.ceil(self.M / grid_rows))
         idx = 0
-        for i in range(grid_width):
-            for j in range(self.M // grid_width):
+        for i in range(grid_rows):
+            for j in range(grid_cols):
                 if idx < self.M:
                     bs_pos_np[idx] = [
-                        (i + 0.5) * (self.area_size / grid_width), 
-                        (j + 0.5) * (self.area_size / (self.M // grid_width)), 
+                        (i + 0.5) * (self.area_size / grid_rows), 
+                        (j + 0.5) * (self.area_size / grid_cols), 
                         0.0 # 基站通常建在地面或低矮桅杆上，统一设其Z坐标为0
                     ]
                     idx += 1
         
-        self.bs_pos = torch.tensor(bs_pos_np, device=self.device, dtype=torch.float32)
+        self.bs_pos = torch.tensor(bs_pos_np, device=self.torch_device, dtype=torch.float32)
+        self.bs_pos_batch = self.bs_pos.unsqueeze(0)
         
         # 状态空间 (Observation Space):
         # 维度包含：每架无人机的三维坐标 (3) + 基站数量 (M) 个大尺度衰落系数 beta_mk
         # 展平后为形状为 (K * (3 + M),) 的连续型一维向量状态
         uav_feat_dim = 3 + self.M
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, 
+            low=-1.0, high=1.0,
             shape=(self.K * uav_feat_dim,), 
             dtype=np.float32
         )
         
         # 动作空间 (Action Space):
-        # Tianshou中的Actor网络最典型的是输出在 [-1, 1] 范围的连续值。
-        # 此环境期望接收一维大小为 M * K 的数组，此后会在 step 函数中被 Softmax 和截断以实施合法的功率按份分配。
+        # Phase 3 起将动作显式建模为每个基站上的非负功率份额。
+        # 环境会对每个基站对应的 K 维动作做非负截断并重新归一化到 simplex。
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, 
+            low=0.0, high=1.0,
             shape=(self.M * self.K,), 
             dtype=np.float32
         )
 
         # 内部状态：维护当前时间步所有的无人机坐标 (Tensor)
         self.uav_pos = None
+        self.beta_cache = None
+        self.gamma_cache = None
+        self.obs_cache = None
+        self.obs_cache_np = None
+        self.zero_t = torch.tensor(0.0, device=self.torch_device, dtype=torch.float32)
+        self.qos_threshold_t = torch.tensor(self.qos_threshold, device=self.torch_device, dtype=torch.float32)
+        self.obs_eps = torch.tensor(self.params.numeric_eps, device=self.torch_device, dtype=torch.float32)
+
+    def _project_action_to_simplex(self, action_matrix):
+        action_matrix = torch.clamp_min(action_matrix, 0.0)
+        action_sums = action_matrix.sum(dim=1, keepdim=True)
+        zero_mask = action_sums <= self.obs_eps
+        if torch.any(zero_mask):
+            action_matrix = action_matrix.clone()
+            action_matrix[zero_mask.expand_as(action_matrix)] = 1.0
+            action_sums = action_matrix.sum(dim=1, keepdim=True)
+        eta_mk = action_matrix / action_sums
+        return eta_mk
+
+    def _obs_to_numpy(self, obs):
+        return obs.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def _refresh_state_cache(self):
+        with torch.inference_mode():
+            t_uav = self.uav_pos.unsqueeze(0)
+            D_mk, _, theta_mk = self.ch_model.compute_distances_and_angles(self.bs_pos_batch, t_uav)
+            self.beta_cache = self.ch_model.compute_large_scale_fading(D_mk, theta_mk)
+            self.gamma_cache = self.ch_model.compute_channel_estimation_variance(self.beta_cache)
+
+            beta_tensor = self.beta_cache.squeeze(0)
+            norm_pos = self.uav_pos.clone()
+            norm_pos[:, 0:2] = (norm_pos[:, 0:2] / self.area_size) * 2.0 - 1.0
+            norm_pos[:, 2] = ((norm_pos[:, 2] - self.min_h) / (self.max_h - self.min_h)) * 2.0 - 1.0
+            beta_log10 = torch.log10(beta_tensor.t() + self.obs_eps)
+            norm_beta = torch.clamp(
+                (beta_log10 - self.obs_beta_log10_center) / self.obs_beta_log10_scale,
+                min=-1.0,
+                max=1.0,
+            )
+            self.obs_cache = torch.cat([norm_pos, norm_beta], dim=1).flatten()
+            self.obs_cache_np = self._obs_to_numpy(self.obs_cache)
 
     def reset(self, seed=None, options=None):
         """
@@ -91,57 +141,27 @@ class UavMimoEnv(gym.Env):
             # 即使主要逻辑在 GPU，也同步一下 numpy seed 以防万一
             np.random.seed(seed)
             torch.manual_seed(seed)
+            if self.device.startswith('cuda'):
+                torch.cuda.manual_seed_all(seed)
             
         # 随机设定无人机的三维空间分布 (直接在 GPU 上生成)
         # x, y: [0, area_size]
         # z: [min_h, max_h]
         # 形状: (K, 3)
-        self.uav_pos = torch.rand((self.K, 3), device=self.device, dtype=torch.float32)
+        self.uav_pos = torch.rand((self.K, 3), device=self.torch_device, dtype=torch.float32)
         # 缩放 x (dim=0) 和 y (dim=1)
         self.uav_pos[:, 0] = self.uav_pos[:, 0] * self.area_size
         self.uav_pos[:, 1] = self.uav_pos[:, 1] * self.area_size
         # 缩放 z (dim=2)
         self.uav_pos[:, 2] = self.uav_pos[:, 2] * (self.max_h - self.min_h) + self.min_h
+        self._refresh_state_cache()
         
-        return self._get_obs(), {}
+        return self.obs_cache_np, {}
 
     def _get_obs(self):
-        """
-        获取当前环境的观测状态 (State)。
-        包含了经过归一化处理后的无人机三维坐标以及其和所有基站通信的大尺度衰落特征 (beta_mk)。
-        返回的是 Torch Tensor。
-        """
-        # 使用 PyTorch 上下文，无需梯度
-        with torch.no_grad():
-            # 扩展维度为 Batch=1 以适配 BatchedMIMOChannel: (1, M, 3) 和 (1, K, 3)
-            # 这里的 self.bs_pos 和 self.uav_pos 已经是 Tensor 且在 device 上
-            t_bs = self.bs_pos.unsqueeze(0)
-            t_uav = self.uav_pos.unsqueeze(0)
-            
-            D_mk, R_mk, theta_mk = self.ch_model.compute_distances_and_angles(t_bs, t_uav)
-            beta_mk = self.ch_model.compute_large_scale_fading(D_mk, theta_mk) # (1, M, K)
-        
-            # 移除 Batch 维度: (M, K)
-            beta_tensor = beta_mk.squeeze(0)
-            
-            # --- 构建特征 ---
-            # features 需要合并 uav_pos(K, 3) 和 beta 的转置(K, M)
-            # beta_tensor.t() -> (K, M)
-            # torch.cat 沿着 dim=1
-            
-            # 为了归一化，先拷贝一份 uav_pos (避免修改原始状态)
-            norm_pos = self.uav_pos.clone()
-            norm_pos[:, 0:2] /= self.area_size
-            norm_pos[:, 2] /= self.max_h
-            
-            # 大尺度衰落系数对数变换
-            # log10(beta + 1e-12) / 10.0
-            norm_beta = torch.log10(beta_tensor.t() + 1e-12) / 10.0
-            
-            features = torch.cat([norm_pos, norm_beta], dim=1) # (K, 3+M)
-            
-            # 展平返回
-            return features.flatten()
+        if self.obs_cache is None:
+            self._refresh_state_cache()
+        return self.obs_cache
 
     def step(self, action):
         """
@@ -152,62 +172,66 @@ class UavMimoEnv(gym.Env):
         # 1. 动作加工与整形阶段
         # 确保 action 是 Tensor 并位于正确设备
         if isinstance(action, np.ndarray):
-            action = torch.as_tensor(action, device=self.device, dtype=torch.float32)
+            action = torch.as_tensor(action, device=self.torch_device, dtype=torch.float32)
         elif isinstance(action, torch.Tensor):
-             if action.device != torch.device(self.device):
-                 action = action.to(self.device)
+             if action.device != self.torch_device or action.dtype != torch.float32:
+                 action = action.to(device=self.torch_device, dtype=torch.float32)
         
         # action shape: (M * K,)
         action_matrix = action.reshape(self.M, self.K)
         
-        # 利用 PyTorch 原生 Softmax 操作
-        # 对由 K 个用户构成的维度 (dim=1) 进行 Softmax，保证 sum_k(eta_mk) = 1
-        # 之前的代码是: np.exp(x - max) / sum(exp)
-        # F.softmax 会自动处理数值稳定性
-        eta_mk = F.softmax(action_matrix, dim=1) # (M, K)
+        eta_mk = self._project_action_to_simplex(action_matrix)
         
         # 2. 核心张量环境评估
-        with torch.no_grad():
-            t_bs = self.bs_pos.unsqueeze(0)
-            t_uav = self.uav_pos.unsqueeze(0)
+        if self.beta_cache is None or self.gamma_cache is None:
+            self._refresh_state_cache()
+
+        with torch.inference_mode():
             t_eta = eta_mk.unsqueeze(0) # (1, M, K)
-            
-            # 物理信道计算
-            D_mk, R_mk, theta_mk = self.ch_model.compute_distances_and_angles(t_bs, t_uav)
-            beta_mk = self.ch_model.compute_large_scale_fading(D_mk, theta_mk)
-            gamma_mk = self.ch_model.compute_channel_estimation_variance(beta_mk)
-            
             # 计算容量
-            C_k, SINR = self.ch_model.compute_ergodic_capacities(beta_mk, gamma_mk, t_eta)
+            C_k, sinr = self.ch_model.compute_ergodic_capacities(self.beta_cache, self.gamma_cache, t_eta)
             
             # C_k shape: (1, K) -> (K,)
             c_k_t = C_k.squeeze(0)
+            sinr_t = sinr.squeeze(0)
         
         # 3. 强化学习的奖励 (Reward) 设计
-        # A. Sum-rate
         sum_rate = torch.sum(c_k_t)
-        
-        # B. QoS Penalty
-        qos_penalty = torch.tensor(0.0, device=self.device)
-        if self.qos_method == 'static':
-            # violations = max(0, threshold - capacity)
-            # torch.max(input, other)
-            # constant tensor for threshold
-            thresh_t = torch.tensor(self.qos_threshold, device=self.device)
-            violations = torch.maximum(torch.tensor(0.0, device=self.device), thresh_t - c_k_t)
+        violations = torch.clamp_min(self.qos_threshold_t - c_k_t, 0.0)
+        qos_penalty = self.zero_t.to(dtype=sum_rate.dtype)
+        if self.include_qos_penalty and self.qos_method == 'static':
             qos_penalty = -50.0 * torch.sum(violations)
-        
-        reward = sum_rate + qos_penalty
+
+        reward_raw = sum_rate + qos_penalty
+        reward = reward_raw * self.reward_scale
         
         terminated = True
         truncated = False
         
         # Info 字典通常用于调试或日志，通常需要转为 CPU 数字/列表以便能够被 logger 正常记录
         # 如果追求极致速度，可精简或移除 info
+        sum_rate_sq = torch.square(sum_rate)
+        sum_rate_denom = self.K * torch.sum(torch.square(c_k_t)) + c_k_t.new_tensor(self.params.numeric_eps)
+        fairness = sum_rate_sq / sum_rate_denom
+        action_entropy = -torch.sum(eta_mk * torch.log(eta_mk + self.params.numeric_eps), dim=1).mean()
+
         info = {
+            "reward": float(reward.item()),
+            "reward_raw": float(reward_raw.item()),
+            "reward_scale": float(self.reward_scale),
             "sum_rate": float(sum_rate.item()),
-            # "capacities": c_k_t.cpu().tolist(), # 可选，耗时较多
-            # "violations_sum": ...
+            "min_rate": float(torch.min(c_k_t).item()),
+            "max_rate": float(torch.max(c_k_t).item()),
+            "mean_rate": float(torch.mean(c_k_t).item()),
+            "mean_sinr": float(torch.mean(sinr_t).item()),
+            "max_sinr": float(torch.max(sinr_t).item()),
+            "jain_fairness": float(fairness.item()),
+            "qos_threshold": float(self.qos_threshold),
+            "qos_violation_count": int(torch.count_nonzero(violations > 0.0).item()),
+            "qos_violation_gap": float(torch.sum(violations).item()),
+            "action_entropy": float(action_entropy.item()),
+            "action_max_share": float(torch.max(eta_mk).item()),
+            "action_min_share": float(torch.min(eta_mk).item()),
         }
         
         # 注意: 
@@ -218,4 +242,4 @@ class UavMimoEnv(gym.Env):
         # 但这步开销无法避免，除非 Collector 也在 GPU 上。
         # 只要我们去掉了 step 内部的来回转换，就已经达成了 Phase 1 目标。
         
-        return self._get_obs(), reward.item(), terminated, truncated, info
+        return self.obs_cache_np, float(reward.item()), terminated, truncated, info

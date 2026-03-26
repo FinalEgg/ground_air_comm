@@ -21,10 +21,14 @@ def test_environment_loop():
     
     obs_next, reward, terminated, truncated, info = env.step(action)
     
-    print(f"Reward: {reward}")
+    print(f"Scaled Reward: {reward}")
+    print(f"Raw Reward: {info['reward_raw']}")
     print(f"Sum-Rate: {info['sum_rate']}")
-    print(f"Individual capacities: \n{info['capacities']}")
-    print(f"QoS Violations sum: {info['violations_sum']}")
+    print(f"Min/Mean/Max Rate: {info['min_rate']} / {info['mean_rate']} / {info['max_rate']}")
+    print(f"QoS Violation Count: {info['qos_violation_count']}")
+    print(f"QoS Violation Gap: {info['qos_violation_gap']}")
+    print(f"Jain Fairness: {info['jain_fairness']}")
+    print(f"Action Entropy: {info['action_entropy']}")
     print(f"Terminated: {terminated}")
 
 if __name__ == "__main__":

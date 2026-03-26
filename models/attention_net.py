@@ -15,6 +15,7 @@ class UAVAttentionNet(nn.Module):
         self.feature_dim = 3 + self.M 
         self.hidden_dim = hidden_dim
         self.device = device
+        self.target_device = torch.device(device)
         
         # 1. 词嵌入层 (Token Embedding): 将物理特征映射到高维空间
         self.param_embedding = nn.Linear(self.feature_dim, hidden_dim)
@@ -36,8 +37,27 @@ class UAVAttentionNet(nn.Module):
         
         # 返回给下游 Actor/Critic 的特征总维度 
         self.output_dim = self.K * hidden_dim
+
+        self.reset_parameters()
         
         self.to(device)
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.param_embedding.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.zeros_(self.param_embedding.bias)
+
+        nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.zeros_(self.fc1.bias)
+
+        nn.init.xavier_uniform_(self.attention.in_proj_weight)
+        nn.init.zeros_(self.attention.in_proj_bias)
+        nn.init.xavier_uniform_(self.attention.out_proj.weight)
+        nn.init.zeros_(self.attention.out_proj.bias)
+
+        nn.init.ones_(self.norm1.weight)
+        nn.init.zeros_(self.norm1.bias)
+        nn.init.ones_(self.norm2.weight)
+        nn.init.zeros_(self.norm2.bias)
 
     def forward(self, obs, state=None, info={}):
         """
@@ -46,7 +66,10 @@ class UAVAttentionNet(nn.Module):
         """
         # 使用 as_tensor 避免重复内存拷贝，这是比手动 isinstance 判断更优的 torch 惯用写法
         # 如果 obs 已经在正确的 device 上，它几乎是零开销的
-        obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.as_tensor(obs, device=self.target_device, dtype=torch.float32)
+        elif obs.device != self.target_device or obs.dtype != torch.float32:
+            obs = obs.to(device=self.target_device, dtype=torch.float32)
             
         # 如果是单一样本，增加 Batch 维度
         if len(obs.shape) == 1:
@@ -56,7 +79,7 @@ class UAVAttentionNet(nn.Module):
         
         # 步骤 1: 序列化 (Reshape into Token Sequence) 
         # (Batch, K, feature_dim)
-        x = obs.view(B, self.K, self.feature_dim)
+        x = obs.reshape(B, self.K, self.feature_dim)
         
         # 步骤 2: 空间特征升维嵌入
         # (Batch, K, hidden_dim)
@@ -64,7 +87,7 @@ class UAVAttentionNet(nn.Module):
         
         # 步骤 3: Attention 干扰解析
         # PyTorch 的 MultiheadAttention 会自动基于传入的 x_emb 计算内部的 Q, K, V
-        attn_out, attn_weights = self.attention(x_emb, x_emb, x_emb)
+        attn_out, _ = self.attention(x_emb, x_emb, x_emb, need_weights=False)
         
         # 残差连接 (Residual Connection)
         x_add = self.norm1(x_emb + attn_out)
@@ -74,7 +97,7 @@ class UAVAttentionNet(nn.Module):
         x_out = self.norm2(x_add + ffn_out) # (Batch, K, hidden_dim)
         
         # 步骤 4: 展平回一维给 Tianshou Actor/Critic 全连接层使用
-        out = x_out.view(B, -1) # (Batch, K * hidden_dim)
+        out = x_out.reshape(B, -1) # (Batch, K * hidden_dim)
         
         return out, state
 

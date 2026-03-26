@@ -21,6 +21,7 @@ class UAVMIMOTensorParams:
         self.p_u = 10**(10/10)  # 上行导频功率 (例如10dBm转换为线性值，基于噪声功率进行缩放)
         self.p_d = 10**(30/10)  # 下行总发射功率 (例如30dBm转换为线性值)
         self.noise_var = 1.0    # 归一化噪声功率方差 (假设信号功率直接等同于信噪比SNR)
+        self.numeric_eps = 1e-12
 
 
 class BatchedMIMOChannel:
@@ -134,6 +135,11 @@ class BatchedMIMOChannel:
         """
         p = self.params
         N = self.N
+        compute_dtype = torch.float64
+        beta = beta_mk.to(dtype=compute_dtype)
+        gamma = gamma_mk.to(dtype=compute_dtype)
+        eta = eta_mk.to(dtype=compute_dtype)
+        eps = torch.tensor(p.numeric_eps, device=beta.device, dtype=compute_dtype)
         
         # eta_mk 是总发射功率的分配比例。
         # 动作空间受限于：对于每个基站 M，都有 sum_k(eta_mk) <= 1。
@@ -144,14 +150,14 @@ class BatchedMIMOChannel:
         # 维度变化: (B, M, K) --在M维度求和--> (B, K)
         # 注意：不同的参考论文中，有时功率系数模块会直接使用eta而不开根号。
         # 这里按照用户的公式(15)，使用了 eta_mk^(1/2)。
-        DS_k = math.sqrt(p.p_d) * N * torch.sum(torch.sqrt(eta_mk + 1e-9) * gamma_mk, dim=1)
+        DS_k = math.sqrt(p.p_d) * N * torch.sum(torch.sqrt(torch.clamp_min(eta, 0.0) + eps) * gamma, dim=1)
         
         # 期望信号的功率项 (|DS_k|^2)
         signal_power = DS_k ** 2  # (B, K)
         
         # 对应公式(16) 波束成形不确定性 (Beamforming Uncertainty, BU_k) 方差
         # Var(BU_k) = p_d * sum_m (eta_mk * N * beta_mk * gamma_mk)
-        BU_var = p.p_d * N * torch.sum(eta_mk * beta_mk * gamma_mk, dim=1) # (B, K)
+        BU_var = p.p_d * N * torch.sum(eta * beta * gamma, dim=1) # (B, K)
         
         # 对应公式(17) 用户间干扰 (User Interference, UI_k_k') 方差
         # 用户 k' 对用户 k 造成的干扰
@@ -162,23 +168,24 @@ class BatchedMIMOChannel:
         
         # 在每个基站处，计算所有用户的功率分配与gamma乘积的总和
         # 形状: (B, M)
-        sum_eta_gamma = torch.sum(eta_mk * gamma_mk, dim=2) 
+        sum_eta_gamma = torch.sum(eta * gamma, dim=2)
         
         # 受到所有用户(包含自己)造成的总干扰
         # beta_mk: (B, M, K)
         # 将 sum_eta_gamma 扩展到 (B, M, 1) 以便与 beta_mk 相乘
         # total_interf_all = p_d * N * sum_m ( beta_mk * sum_k'(eta_mk' * gamma_mk') )
-        total_interf_all = p.p_d * N * torch.sum(beta_mk * sum_eta_gamma.unsqueeze(2), dim=1) # (B, K)
+        total_interf_all = p.p_d * N * torch.sum(beta * sum_eta_gamma.unsqueeze(2), dim=1) # (B, K)
         
         # 减去 k'=k 时产生的自我干扰部分 (它已在上一步被包含在 total_interf_all 中)
         # 自我干扰部分刚好等于 Var(BU_k)。因此 Interf(k'!=k) = total_interf_all - BU_var
         UI_var = total_interf_all - BU_var # (B, K)
         
         # 噪声功率 (已缩放为1，前文假设信号功率即为SNR)
-        noise = p.noise_var
+        noise = torch.tensor(p.noise_var, device=beta.device, dtype=compute_dtype)
         
         # 对应公式(14) 信道容量 (香农公式)
-        SINR = signal_power / (BU_var + UI_var + noise)
-        C_k = torch.log2(1.0 + SINR) # (B, K)
+        SINR = signal_power / (BU_var + UI_var + noise + eps)
+        SINR = torch.clamp_min(SINR, 0.0)
+        C_k = torch.log1p(SINR) / math.log(2.0) # (B, K)
         
         return C_k, SINR
